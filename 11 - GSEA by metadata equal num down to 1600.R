@@ -1,0 +1,368 @@
+library(tidyverse)
+library(dplyr)
+library(fgsea)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(scales) # to control ggplot color palette
+
+# Function to return current date and time in a filename-friendly format
+myTime <- function() {
+  t <- gsub(":", "", Sys.time())
+  t <- gsub(" ", "_", t)
+  t <- gsub("\\.\\d+", "", t)
+  return(t)
+}
+
+set.seed(1111)
+
+mywd <- paste0("[path]", myTime(), " scDEG by Metadata equal num down to 1600 cells")
+
+dir.create(mywd)
+setwd(mywd)
+
+# (Load datasets below, directly before running GSEA)
+
+# Code from https://biostatsquid.com/fgsea-tutorial-gsea/
+# Function: Adjacency matrix to list
+matrix_to_list <- function(pws){
+  pws.l <- list()
+  for (pw in colnames(pws)) {
+    pws.l[[pw]] <- rownames(pws)[as.logical(pws[, pw])]
+  }
+  return(pws.l)
+}
+
+# Graph all three timepoint comparisons
+graphBarChartHorizontal <- function(myData, cellType, myCompType, myComp) {
+  if (nrow(myData) > 0) { # Make sure there's data in the dataframe
+    
+    myData <- filter(myData, str_detect(pathway, paste(paste0('^', myPathways, '$'), collapse = "|")))
+    
+    myData$pathway <- factor(myData$pathway, levels = rev(myPathways))
+    
+    myData$timepoint <- factor(myData$timepoint, levels = c("Day 1", "Day 3", "Day 7"))
+    
+    # Find width of longest canonical pathway label
+    cpLabels <- as.character(myData$pathway)
+    longestCPLabel <- max(nchar(cpLabels))
+    
+    colors = setNames(hue_pal()(3), c("Day 1", "Day 3", "Day 7"))
+    
+    ggplot(myData, aes(x = pathway, y = NES, fill = timepoint, color = timepoint)) + 
+      geom_bar(aes(alpha = -log10(padj)), stat = "identity", linewidth = 0.4, width = 0.8, position = position_dodge(width = 0.9)) +
+      scale_fill_manual(values = colors) +
+      scale_color_manual(values = colors) +
+      theme_classic() + 
+      theme(axis.text.y = element_text(size = 12),
+            axis.text.x = element_text(size = 12, angle = 90, hjust = 1, vjust = .5),
+            axis.title = element_text(size = 15)) +
+      labs(y = 'NES', x = 'GSEA Hallmark Pathways',
+           alpha = '-log(adj p-value)', color = 'Timepoint', fill = 'Timepoint',
+           title = paste0("GSEA\n", myCompType, "\n", cellType, " - Top pathways (scDEGs)\nscDEGs equalNum\nDown to 1600 cells\nmin.pct=0.1\n")) +
+      scale_y_continuous(limits = c(ifelse(min(myData$NES) < 0, min(myData$NES)*1.5, 0), ifelse(max(myData$NES) > 0, max(myData$NES)*1.5, 0)))
+    ggsave(paste0("Barchart GSEA scDEGs by ", myCompType, " ", myComp, " equalNum down to 1600 cells ", cellType, " " , myTime(),  ".pdf"), 
+           width = (3.3 + .35 * length(myPathways)), height = (4 + 0.06 * longestCPLabel), device = cairo_pdf) 
+  }
+}
+
+
+# Function to perform GSEA (Code from https://bioinformaticsbreakdown.com/how-to-gsea/ (Brian Gudenas))
+GSEA = function(gene_list, GMT_file, pval, myGeneset, myComparison, myTimepoint, myCluster) {
+  set.seed(1111)
+
+  if ( any( duplicated(names(gene_list)) )  ) {
+    warning("Duplicates in gene names")
+    gene_list = gene_list[!duplicated(names(gene_list))]
+  }
+  if  ( !all( order(gene_list, decreasing = TRUE) == 1:length(gene_list)) ){
+    warning("Gene list not sorted")
+    gene_list = sort(gene_list, decreasing = TRUE)
+  }
+  myGMT = fgsea::gmtPathways(GMT_file)
+  
+  # Subset GMT lists on only the genes present in our dataset to avoid bias (from https://biostatsquid.com/fgsea-tutorial-gsea/)
+  GMTgenes <- unique(unlist(myGMT))
+  
+  # Convert gmt file to a matrix with the genes as rows and for each go annotation (columns) the values are 0 or 1
+  GMTmat <- matrix(NA, dimnames = list(GMTgenes, names(myGMT)),
+                nrow = length(GMTgenes), ncol = length(myGMT))
+  for (i in 1:dim(GMTmat)[2]){
+    GMTmat[,i] <- as.numeric(GMTgenes %in% myGMT[[i]])
+  }
+  
+  #Subset to the genes that are present in our data to avoid bias
+  intersectGenes <- intersect(names(gene_list), GMTgenes)
+  GMTmat <- GMTmat[intersectGenes, colnames(GMTmat)[which(colSums(GMTmat[intersectGenes,])>5)]] # filter for gene sets with more than 5 genes annotated
+  # And get the list again using the function we previously defined
+  final_list <- matrix_to_list(GMTmat)
+  myGMT <- final_list
+  
+  fgRes <- fgsea::fgsea(pathways = myGMT,
+                        stats = gene_list,
+                        minSize=15, ## minimum gene set size
+                        maxSize=400#, ## maximum gene set size
+                        ) %>% 
+    as.data.frame() %>% 
+    dplyr::filter(padj < !!pval) %>% 
+    arrange(desc(NES))
+  message(paste("Number of signficant gene sets =", nrow(fgRes)))
+  
+  message("Collapsing Pathways -----")
+  concise_pathways = collapsePathways(data.table::as.data.table(fgRes),
+                                      pathways = myGMT,
+                                      stats = gene_list)
+  fgRes = fgRes[fgRes$pathway %in% concise_pathways$mainPathways, ]
+  message(paste("Number of gene sets after collapsing =", nrow(fgRes)))
+  
+  fgRes$Enrichment = ifelse(fgRes$NES > 0, "Up-regulated", "Down-regulated")
+  
+  # Clean up pathway names (specific for Hallmark pathways)
+  fgRes$pathway <- str_sub(fgRes$pathway, 10) %>%
+    str_replace_all("_", " ")
+  
+  # Filter on pathways with highest absolute NES
+  orderedRows <- order(abs(fgRes$NES), decreasing = TRUE)
+  orderedRows_top10 <- orderedRows[1:10][!is.na(orderedRows[1:10])]
+  filtRes10 = fgRes[orderedRows_top10,]
+  
+  # Placeholder plot in case there are no pathways to graph
+  g10 <- ggplot()
+  
+  if (nrow(filtRes10) > 0) {
+    total_up = sum(fgRes$Enrichment == "Up-regulated")
+    total_down = sum(fgRes$Enrichment == "Down-regulated")
+    header = paste0("Top 10 (Total pathways: Up=", total_up,", Down=",    total_down, ")")
+    
+    colors = setNames(c("red", "blue"),
+                     c("Up-regulated", "Down-regulated"))
+    
+    # find x min and max to manually set axis limits
+    xmin <- min(filtRes10$NES)
+    xmax <- max(filtRes10$NES)
+    myRange <- xmax - xmin
+    
+    # Find width of longest canonical pathway label
+    myLabels <- as.character(filtRes10$pathway)
+    longestLabel <- max(nchar(myLabels))
+    
+    g10= 
+      ggplot(filtRes10, aes(NES, reorder(pathway, NES))) +
+        theme_classic() +
+        geom_point(aes(color = Enrichment, size = -log10(padj)), alpha = 0.6) +
+        scale_color_manual(values = colors) +
+        scale_size_continuous(range = c(2,8)) +
+        theme(axis.text.y = element_text(size = 12),
+              axis.text.x = element_text(size = 12, angle = 45, hjust = 0.95),
+              axis.title = element_text(size = 15),
+              title = element_text(size = 10)) +
+        #geom_vline(xintercept = 0) +
+        labs(y = paste('GSEA', myGeneset), x = 'NES',
+             size = '-log(FDR q-val)', color = 'Direction',
+             title = paste0("GSEA NoNPerm top 10\nscDEGs equalNum; down to 1600 cells; min.pct=0.1\n", myCluster, " ", myTimepoint, " ", myComparison, "\n", myGeneset, "\n ")) +
+        xlim(xmin - 0.2 * myRange, xmax + 0.2 * myRange)
+      
+    g10
+    ggsave(paste0("Dotplot GSEA top 10 by metadata down to 1600 cells ", myComparison, " ", myGeneset, " ", myCluster, " ", myTimepoint, " ", myTime(),  ".pdf"), 
+           height = (2.2 + .25 * nrow(filtRes10)), width = (3.2 + 0.11 * longestLabel), device = cairo_pdf)
+  }
+  
+  # Same, but plot top 20
+  orderedRows_top20 <- orderedRows[1:20][!is.na(orderedRows[1:20])]
+  filtRes20 = fgRes[orderedRows_top20,]
+  
+  # Placeholder plot in case there are no pathways to graph
+  g20 <- ggplot()
+  
+  if (nrow(filtRes20) > 0) {
+    total_up = sum(fgRes$Enrichment == "Up-regulated")
+    total_down = sum(fgRes$Enrichment == "Down-regulated")
+    header = paste0("Top 20 (Total pathways: Up=", total_up,", Down=",    total_down, ")")
+    
+    colors = setNames(c("red", "blue"),
+                      c("Up-regulated", "Down-regulated"))
+    
+    # find x min and max to manually set axis limits
+    xmin <- min(filtRes20$NES)
+    xmax <- max(filtRes20$NES)
+    myRange <- xmax - xmin
+    
+    # Find width of longest canonical pathway label
+    myLabels <- as.character(filtRes20$pathway)
+    longestLabel <- max(nchar(myLabels))
+    
+    # Make dot plot
+    g20= 
+      ggplot(filtRes20, aes(NES, reorder(pathway, NES))) +
+      theme_classic() +
+      geom_point(aes(color = Enrichment, size = -log10(padj)), alpha = 0.6) +
+      scale_color_manual(values = colors) +
+      scale_size_continuous(range = c(2,8)) +
+      theme(axis.text.y = element_text(size = 12),
+            axis.text.x = element_text(size = 12, angle = 45, hjust = 0.95),
+            axis.title = element_text(size = 15),
+            title = element_text(size = 10)) +
+      labs(y = paste('GSEA', myGeneset), x = 'NES',
+           size = '-log(FDR q-val)', color = 'Direction',
+           title = paste0("GSEA NoNPerm top 20\nscDEGs equalNum; down to 1600 cells; min.pct=0.1\n", myCluster, " ", myTimepoint, " ", myComparison, "\n", myGeneset, "\n ")) +
+      xlim(xmin - 0.2 * myRange, xmax + 0.2 * myRange)
+    
+    g20
+    ggsave(paste0("Dotplot GSEA top 20 by metadata down to 1600 cells ", myComparison, " ", myGeneset, " ", myCluster, " ", myTimepoint, " ", myTime(),  ".pdf"), 
+           height = (2.2 + .25 * nrow(filtRes20)), width = (3.2 + 0.11 * longestLabel), device = cairo_pdf)
+  }
+  
+  output = list("Results" = fgRes, "Plot_top10" = g10, "Plot_top20" = g20)
+  return(output)
+}
+
+# Build list of scDEGs calculated with Seurat
+# Build list of comparisons
+# Path for DEGs calculated in script "08 - DEGs by metadata equal num down to 1600.R"
+DEG_dir <- '[path]/ by metadata equalNum down to 1600 cells/'
+filename_start <- 'DEGs by metadata '
+file_list <- list.files(path = DEG_dir)
+file_list <- file_list[grep("txt$", file_list)]
+compType <- unique(str_extract(file_list, 'DEGs\\ by\\ metadata\\ [:graph:]*')) %>%
+  str_sub(start = 18)
+comparison <- unique(str_extract(file_list, 'DEGs\\ by\\ metadata\\ [:graph:]*\\ [:graph:]*\\ \\-\\ [:graph:]*')) %>%
+  str_extract('[:graph:]*\\ \\-\\ [:graph:]*$')
+
+scDEGListbyMetadata <- list()
+clusters <- c('Monocytes', 'CD16+ Monocytes', 'CD4+ T cells', 'CD8+ T cells', 'NK cells', 'B cells')
+timepoints <- c('Day 1', 'Day 3', 'Day 7')
+for (cType in compType) {
+  for (comp in comparison) {
+    for (c in clusters) {
+      for (t in timepoints) {
+        filename <- paste0(DEG_dir, filename_start, cType, ' ', comp, ' equalNum down to 1600 cells ', c, ' ', t, '.txt')
+        if (file.exists(filename)){
+          df <- read_delim(filename, delim = '\t')
+          df <- df[order(df$avg_log2FC, decreasing = TRUE),]
+          vector <- df$avg_log2FC
+          names(vector) <- df$...1
+          scDEGListbyMetadata[[paste(cType, comp, c, t)]] <- vector
+        }
+      }
+    }
+  }
+}
+
+# Calculate and graph bubble plots
+GSEA_res_Metadata_Hallmark <- list()
+for (i in 1:length(scDEGListbyMetadata)) {
+  gene_list <- scDEGListbyMetadata[[i]]
+  GMT_file = "[path]/msigdb_v2023.2.Hs_GMTs/symbols/h.all.v2023.2.Hs.symbols.gmt"
+  
+  geneset <- "MSigDB Hallmark Geneset"
+  dataset <- str_split(names(scDEGListbyMetadata)[i], pattern = " ")[[1]]
+  cType <- dataset[1]
+  comp <- str_c(dataset[c(2:4)], collapse = " ")
+  cluster <- dataset[5]
+  timepoint <- str_c(dataset[c(-2, -1)], collapse = " ")
+
+  res = GSEA(gene_list, GMT_file, pval = 0.05, geneset, comp, timepoint, cluster)
+  GSEA_res_Metadata_Hallmark[[names(scDEGListbyMetadata)[i]]] <- res
+  gc()
+}
+save(GSEA_res_Metadata_Hallmark, file = "GSEA_scDEGs_equalNum_down_to_1600_Metadata_Hallmark.RData")
+
+# Load previously run GSEA results
+load("[path]/GSEA_scDEGs_equalNum_down_to_1600_Metadata_Hallmark.RData")
+
+# Plot all timepoints
+for (cType in compType) {
+  for (comp in comparison) {
+    for (pop in c('CD4+ T cells', 'CD8+ T cells', 'NK cells', 'B cells', 'Monocytes', 'CD16+ Monocytes')) {
+      if (!is.null(GSEA_res_Metadata_Hallmark[[paste(cType, comp, pop, 'Day 1')]])) {
+        d1 <- GSEA_res_Metadata_Hallmark[[paste(cType, comp, pop, 'Day 1')]]$Results
+        d3 <- GSEA_res_Metadata_Hallmark[[paste(cType, comp, pop, 'Day 3')]]$Results
+        d7 <- GSEA_res_Metadata_Hallmark[[paste(cType, comp, pop, 'Day 7')]]$Results
+        
+        # To allow empty dfs to be combined
+        if (nrow(d1) > 0) {
+          d1$timepoint <- "Day 1"
+        }
+        if (nrow(d3) > 0) {
+          d3$timepoint <- "Day 3"
+        }
+        if (nrow(d7) > 0) {
+          d7$timepoint <- "Day 7"
+        }
+        class(d1$Enrichment) <- 'character'
+        class(d3$Enrichment) <- 'character'
+        class(d7$Enrichment) <- 'character'
+        
+        barchartData <- bind_rows(d1, d3) %>%
+          bind_rows(d7)
+        
+        # Fill in missing pathways
+        bcDataSpread <- select(barchartData, c(pathway, timepoint, NES))
+        bcDataSpread <- spread(bcDataSpread, key = timepoint, value = NES)
+        if (!("Day 1" %in% colnames(bcDataSpread))) { # Add timepoints that have no pathways at all
+          bcDataSpread$`Day 1` <- 0
+        }
+        if (!("Day 3" %in% colnames(bcDataSpread))) {
+          bcDataSpread$`Day 3` <- 0
+        }
+        if (!("Day 7" %in% colnames(bcDataSpread))) {
+          bcDataSpread$`Day 7` <- 0
+        }
+        bcDataGather <- gather(bcDataSpread, key = timepoint, value = NES, 2:ncol(bcDataSpread))
+        barchartData <- left_join(bcDataGather, barchartData, by = c('pathway', 'timepoint'), suffix = c("", ".y")) %>%
+          select(-ends_with(".y")) # join dfs and remove duplicate column
+        barchartData[is.na(barchartData)] <- 0 # replace NAs with zeros
+        
+        # Select top 15 pathways
+        barchartData <- barchartData[order(abs(barchartData$NES), decreasing = TRUE),]
+        barchartData <- filter(barchartData, pathway %in% unique(barchartData$pathway)[1:15])
+        
+        # Order by NES
+        barchartData <- barchartData[order(barchartData$NES),]
+        if (nrow(filter(barchartData, timepoint == 'Day 1')) > 0) {
+          D1only <- filter(barchartData, timepoint == 'Day 1')
+          D1order <- D1only[order(D1only$NES),]$pathway
+          D1order <- factor(D1order, levels = D1order)
+          barchartData$pathway <- factor(barchartData$pathway, levels = D1order)
+        } else if (nrow(filter(barchartData, timepoint == 'Day 3')) > 0) {
+          D3only <- filter(barchartData, timepoint == 'Day 3')
+          D3order <- D3only[order(D3only$NES),]$pathway
+          D3order <- factor(D3order, levels = D3order)
+          barchartData$pathway <- factor(barchartData$pathway, levels = D3order)
+        } else if (nrow(filter(barchartData, timepoint == 'Day 7')) > 0) {
+          D7only <- filter(barchartData, timepoint == 'Day 7')
+          D7order <- D7only[order(D7only$NES),]$pathway
+          D7order <- factor(D7order, levels = D1order)
+          barchartData$pathway <- factor(barchartData$pathway, levels = D7order)
+        }
+        
+        myPathways <- unique(barchartData$pathway)
+        graphBarChartHorizontal(barchartData, pop, cType, comp)
+      }
+    }
+  }
+}
+
+# Plot number of pathways associated with different clinical characteristics
+nPathways <- data.frame(Metadata = character(),
+                        Population = character(),
+                        Timepoint = character(),
+                        NumPathways = numeric())
+for (i in 1:length(GSEA_res_Metadata_Hallmark)) {
+  tempMetadata <- names(GSEA_res_Metadata_Hallmark)[[i]]
+  tempMetadata <- str_split(tempMetadata, " ")[[1]]
+  tempMetadata <- tempMetadata[-c(2, 3, 4)]
+  tempPopulation <- paste(tempMetadata[2:(length(tempMetadata) - 2)], collapse = ' ')
+  tempTimepoint <- paste0(tempMetadata[length(tempMetadata) - 1], tempMetadata[length(tempMetadata)])
+  tempMetadata <- tempMetadata[1]
+  tempNum <- length(GSEA_res_Metadata_Hallmark[[i]]$Results$pathway)
+  tempdf <- data.frame(Metadata = tempMetadata,
+                       Population = tempPopulation,
+                       Timepoint = tempTimepoint,
+                       NumPathways = tempNum)
+  nPathways <- bind_rows(nPathways, tempdf)
+}
+
+
+
+
